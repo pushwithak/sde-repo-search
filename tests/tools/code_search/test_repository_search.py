@@ -1,19 +1,49 @@
 """Functional tests for Repository Search Tool."""
 
+import json
+
 import pytest
 
-from akd.structures import SearchResultItem
-from akd.tools.misc import HttpUrlAdapter
-
-from akd_ext.structures import SDEIndexedDocumentType
+import akd_ext.tools.code_search.repository_search as repository_search_module
 from akd_ext.tools.code_search.repository_search import (
     RepositorySearchTool,
     RepositorySearchToolConfig,
     RepositorySearchToolInputSchema,
     RepositorySearchToolOutputSchema,
-    _github_repo_name,
 )
-from akd_ext.tools.sde_search import DEFAULT_SDE_BASE_URL, SDEDocument, SDESearchToolOutputSchema
+
+
+class TestRepositorySearchBackend:
+    """Guards the SDE backend contract: current code endpoint + min_score on every request."""
+
+    @pytest.mark.unit
+    def test_default_targets_current_code_endpoint(self):
+        config = RepositorySearchToolConfig()
+        assert config.base_url == "https://dyejsbdumgpqz.cloudfront.net/api/code/search"
+        assert config.min_score == 0.0
+
+    @pytest.mark.unit
+    def test_sde_search_sends_min_score(self, monkeypatch):
+        """min_score must be on every payload: the endpoint applies a 0.55 default and returns
+        nothing when it is omitted, so a dropped min_score silently breaks the tool."""
+        captured: dict = {}
+
+        class _Response:
+            @staticmethod
+            def json() -> dict:
+                return {"documents": []}
+
+        def _post(url, headers=None, data=None):
+            captured["url"] = url
+            captured["payload"] = json.loads(data)
+            return _Response()
+
+        monkeypatch.setattr(repository_search_module.requests, "post", _post)
+
+        RepositorySearchTool(config=RepositorySearchToolConfig())._sde_search(page=1, query="anything")
+
+        assert captured["url"].endswith("/api/code/search")
+        assert captured["payload"]["min_score"] == 0.0
 
 
 class TestRepositorySearchTool:
@@ -64,90 +94,3 @@ class TestRepositorySearchTool:
         # "nasa python" has >100 results in the SDE code index so any page_size up to the 10 cap works
         result = await tool.arun(RepositorySearchToolInputSchema(queries=["nasa python"]))
         assert len(result.results) == result_size
-
-
-class TestGithubRepoName:
-    """The SDE index mixes web pages in with repositories, so URL parsing must not assume owner/repo."""
-
-    @pytest.mark.unit
-    @pytest.mark.parametrize(
-        "url,expected",
-        [
-            ("https://github.com/NASA-IMPACT/veda-config-ghg", "NASA-IMPACT/veda-config-ghg"),
-            ("https://github.com/SnowEx/uavsar_snow/", "SnowEx/uavsar_snow"),
-            ("https://www.github.com/owner/repo/tree/main", "owner/repo"),
-            ("https://github.com/NASA-IMPACT", None),  # owner only, no repo
-            ("https://github.com/", None),
-            ("https://nuwrf.gsfc.nasa.gov/wrf", None),  # sde-web page, not a repo
-        ],
-    )
-    def test_github_repo_name(self, url: str, expected: str | None):
-        assert _github_repo_name(url) == expected
-
-
-class TestRepositorySearchBackend:
-    @pytest.mark.unit
-    def test_defaults_target_unified_search_backend(self):
-        """Repository search reads the same SDE host/min_score contract as SDESearchTool."""
-        config = RepositorySearchToolConfig()
-        assert config.min_score == 0.0
-        assert RepositorySearchTool(config=config).sde_tool.config.min_score == 0.0
-
-    @pytest.mark.unit
-    async def test_query_is_scoped_to_software_and_tools(self, monkeypatch):
-        """The SDE query must be filtered to code, since /api/search spans all document types."""
-        tool = RepositorySearchTool(config=RepositorySearchToolConfig(page_size=4))
-        captured: dict = {}
-
-        async def _arun(params, **kwargs):
-            captured["params"] = params
-            return SDESearchToolOutputSchema(results=[], extra={})
-
-        monkeypatch.setattr(tool.sde_tool, "arun", _arun)
-        await tool._arun_single_query("radar reader", max_results=2)
-
-        assert captured["params"].doc_type == SDEIndexedDocumentType.SOFTWARE_TOOLS
-        assert captured["params"].limit == 4
-
-    @pytest.mark.unit
-    async def test_enrichment_skips_non_github_results(self):
-        """A non-GitHub hit yields empty metadata rather than raising on URL parsing."""
-        tool = RepositorySearchTool()
-        item = SearchResultItem(
-            query="q",
-            title="NU-WRF",
-            content="",
-            url=HttpUrlAdapter.validate_python("https://nuwrf.gsfc.nasa.gov/"),
-        )
-
-        enriched = await tool._enrich_code_search_with_metadata(item)
-
-        assert enriched.reliability_score is None
-        assert enriched.repository_metadata.is_null_metadata
-
-    @pytest.mark.unit
-    def test_shares_the_single_sde_host_constant(self):
-        """Both SDE-backed tools must resolve the same default host."""
-        assert RepositorySearchToolConfig().base_url == DEFAULT_SDE_BASE_URL
-
-    @pytest.mark.unit
-    async def test_unusable_url_is_skipped_not_fatal(self, monkeypatch):
-        """A single non-http(s) URL must not sink the whole query."""
-        tool = RepositorySearchTool(config=RepositorySearchToolConfig(page_size=3))
-
-        def _doc(url: str) -> SDEDocument:
-            return SDEDocument(query="q", title="t", content="c", score=1.0, url=url)
-
-        async def _arun(params, **kwargs):
-            return SDESearchToolOutputSchema(
-                results=[
-                    _doc("ftp://example.org/pkg"),  # unusable: not http(s)
-                    _doc("https://github.com/owner/repo"),
-                ],
-                extra={},
-            )
-
-        monkeypatch.setattr(tool.sde_tool, "arun", _arun)
-        out = await tool._arun_single_query("q", max_results=5)
-
-        assert [str(r.url) for r in out.results] == ["https://github.com/owner/repo"]

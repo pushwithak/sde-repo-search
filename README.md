@@ -35,12 +35,12 @@ uv run python your_script.py
 
 ## MCP server
 
-This deployment exposes exactly two tools over MCP, both backed by the SDE `/api/search` endpoint:
+This deployment exposes exactly two tools over MCP, both backed by the SDE search API:
 
 | Tool | Purpose |
 | --- | --- |
-| `sde_search_tool` | Search NASA's Science Discovery Engine across all indexed document types. |
-| `repository_search_tool` | Search `Software and Tools` documents and enrich GitHub hits with repository metadata and a reliability score. |
+| `sde_search_tool` | Search NASA's Science Discovery Engine (`/api/search`) across all indexed document types. |
+| `repository_search_tool` | Search code repositories (`/api/code/search`) and enrich GitHub hits with repository metadata and a reliability score. |
 
 Run it locally:
 
@@ -73,23 +73,19 @@ git rebase --onto fix/sde-search-endpoint-min-score <old-fix-tip> deploy/sde-rep
 
 ### `min_score` and the SDE backend
 
-Both SDE tools send `min_score` on every request. It is a lower bound on the `_score` each document
-is returned with, and the API applies a server-side default of `0.55` when the field is omitted.
-Hybrid search scores most `Software and Tools` documents around `0.01`, far below that default, so
-omitting the field silently returns nothing. The tools default to `min_score=0.0` and expose it as
-a config field.
+Both tools send `min_score` on every request — `sde_search_tool` on `/api/search`,
+`repository_search_tool` on `/api/code/search`. It is a lower bound on the `_score` each document is
+returned with, and the endpoint applies a server-side default of `0.55` when the field is omitted,
+which is above the score most documents receive — so omitting it silently returns nothing. The tools
+default to `min_score=0.0` and expose it as a config field.
 
 Measured against the current endpoint, for `"UF universal format weather radar .uf reader python
-reflectivity"` scoped to `Software and Tools`:
+reflectivity"`:
 
 | `min_score` | results |
 | --- | --- |
 | omitted (server default `0.55`) | 0 |
 | `0.0` | 385 |
-
-Because `/api/search` spans every document type, a `Software and Tools` hit is not guaranteed to be
-a GitHub repository (the index also contains project web pages). `repository_search_tool` returns
-those results with empty metadata and a `null` reliability score rather than failing.
 
 ### Tool registration
 
