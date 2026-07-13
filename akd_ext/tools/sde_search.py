@@ -29,7 +29,7 @@ class SDESearchToolConfig(BaseToolConfig):
     """Configuration for the SDE Search Tool."""
 
     base_url: str = Field(
-        default=os.getenv("SDE_BASE_URL", DEFAULT_SDE_BASE_URL),
+        default_factory=lambda: os.getenv("SDE_BASE_URL", DEFAULT_SDE_BASE_URL),
         description="Base URL for the SDE API",
     )
     timeout: float = Field(

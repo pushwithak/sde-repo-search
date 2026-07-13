@@ -1,12 +1,11 @@
 import asyncio
-import json
 import os
 from typing import Literal
 from urllib.parse import urlparse
 
-import requests
+import httpx
 from loguru import logger
-from pydantic import Field, computed_field, model_validator
+from pydantic import Field, ValidationError, computed_field, model_validator
 from tenacity import retry, stop_after_attempt
 
 from akd.structures import SearchResultItem
@@ -151,7 +150,7 @@ class RepositorySearchTool(SearchTool):
     config_schema = RepositorySearchToolConfig
 
     @retry(stop=stop_after_attempt(2))
-    def _sde_search(self, page: int, query: str) -> list[dict]:
+    async def _sde_search(self, page: int, query: str) -> list[dict]:
         """POST a single SDE code-search request and return the ``documents`` list."""
         payload = {
             "page": page,
@@ -162,7 +161,9 @@ class RepositorySearchTool(SearchTool):
         }
         if self.debug:
             logger.debug(f"SDE payload: {payload}")
-        response = requests.post(self.config.base_url, headers=self.config.headers, data=json.dumps(payload))
+        # Async client so the SDE round-trip doesn't block the event loop.
+        async with httpx.AsyncClient(timeout=self.config.timeout) as client:
+            response = await client.post(self.config.base_url, headers=self.config.headers, json=payload)
         return response.json()["documents"]
 
     async def _arun_single_query(
@@ -175,7 +176,7 @@ class RepositorySearchTool(SearchTool):
         query_results: list[dict] = []
         for page in range(1, self.config.max_pages + 1):
             try:
-                page_results = self._sde_search(page=page, query=query)
+                page_results = await self._sde_search(page=page, query=query)
             except Exception as e:
                 logger.error(f"Error during SDE search for '{query}' page {page}: {e}")
                 continue
@@ -185,16 +186,24 @@ class RepositorySearchTool(SearchTool):
                 result["query"] = query
             query_results.extend(page_results)
 
-        formatted = [
-            SearchResultItem(
-                title=str(result.get("url", "")).split("/")[-1],
-                url=HttpUrlAdapter.validate_python(result.pop("url", "")),
-                content=result.pop("full_text", ""),
-                query=result.pop("query", ""),
-                extra=result,
+        formatted: list[SearchResultItem] = []
+        for result in query_results[:max_results]:
+            raw_url = result.pop("url", "")
+            try:
+                url = HttpUrlAdapter.validate_python(raw_url)
+            except ValidationError:
+                # Skip a result with a missing/invalid URL rather than failing the whole query.
+                logger.debug(f"Skipping SDE result with invalid URL {raw_url!r}")
+                continue
+            formatted.append(
+                SearchResultItem(
+                    title=raw_url.rstrip("/").split("/")[-1],
+                    url=url,
+                    content=result.pop("full_text", ""),
+                    query=result.pop("query", ""),
+                    extra=result,
+                )
             )
-            for result in query_results[:max_results]
-        ]
         return SearchToolOutputSchema(results=formatted)
 
     async def _arun(self, params: RepositorySearchToolInputSchema) -> RepositorySearchToolOutputSchema:
@@ -208,15 +217,28 @@ class RepositorySearchTool(SearchTool):
         )
         return repository_search_result
 
+    @staticmethod
+    def _github_repo_name(url: str) -> str | None:
+        """Return ``owner/repo`` for a GitHub URL, or None when the URL isn't one.
+
+        The SDE code index is overwhelmingly GitHub repositories, but a result URL is
+        not guaranteed to carry an owner and repo path segment (org pages, other hosts),
+        so callers must handle None rather than index blindly.
+        """
+        parsed = urlparse(url)
+        if parsed.netloc.lower().removeprefix("www.") != "github.com":
+            return None
+        parts = [segment for segment in parsed.path.split("/") if segment]
+        if len(parts) < 2:
+            return None
+        return f"{parts[0]}/{parts[1]}"
+
     async def _enrich_code_search_with_metadata(self, repository_item: SearchResultItem) -> RepositorySearchResultItem:
-        url: str = str(repository_item.url)
-        if not url:
+        repo_name: str | None = self._github_repo_name(str(repository_item.url))
+        if repo_name is None:
+            # Non-GitHub / non-owner-repo URL: return it with empty metadata and a null
+            # reliability score rather than raising and sinking the whole gather.
             return RepositorySearchResultItem(**repository_item.model_dump())
-        # Parse URL to extract owner/repo from github url
-        parsed_url = urlparse(url)
-        path_parts = parsed_url.path.strip("/").split("/")
-        owner, repo = path_parts[0], path_parts[1]
-        repo_name = f"{owner}/{repo}"
         repository_metadata: RepositoryMetadata = await fetch_github_metadata(repo_name, self.config.access_token)
         reliability_score: float | None = calculate_reliability_score(repository_metadata)
         return RepositorySearchResultItem(

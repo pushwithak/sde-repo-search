@@ -1,10 +1,10 @@
 """Functional tests for Repository Search Tool."""
 
-import json
-
+import httpx
 import pytest
 
-import akd_ext.tools.code_search.repository_search as repository_search_module
+from akd.structures import SearchResultItem
+from akd.tools.misc import HttpUrlAdapter
 from akd_ext.tools.code_search.repository_search import (
     RepositorySearchTool,
     RepositorySearchToolConfig,
@@ -23,7 +23,7 @@ class TestRepositorySearchBackend:
         assert config.min_score == 0.0
 
     @pytest.mark.unit
-    def test_sde_search_sends_min_score(self, monkeypatch):
+    async def test_sde_search_sends_min_score(self, monkeypatch):
         """min_score must be on every payload: the endpoint applies a 0.55 default and returns
         nothing when it is omitted, so a dropped min_score silently breaks the tool."""
         captured: dict = {}
@@ -33,17 +33,48 @@ class TestRepositorySearchBackend:
             def json() -> dict:
                 return {"documents": []}
 
-        def _post(url, headers=None, data=None):
+        async def _post(self, url, headers=None, json=None):
             captured["url"] = url
-            captured["payload"] = json.loads(data)
+            captured["payload"] = json
             return _Response()
 
-        monkeypatch.setattr(repository_search_module.requests, "post", _post)
+        monkeypatch.setattr(httpx.AsyncClient, "post", _post)
 
-        RepositorySearchTool(config=RepositorySearchToolConfig())._sde_search(page=1, query="anything")
+        await RepositorySearchTool(config=RepositorySearchToolConfig())._sde_search(page=1, query="anything")
 
         assert captured["url"].endswith("/api/code/search")
         assert captured["payload"]["min_score"] == 0.0
+
+    @pytest.mark.unit
+    @pytest.mark.parametrize(
+        "url,expected",
+        [
+            ("https://github.com/NASA-IMPACT/veda-config-ghg", "NASA-IMPACT/veda-config-ghg"),
+            ("https://github.com/SnowEx/uavsar_snow/", "SnowEx/uavsar_snow"),
+            ("https://www.github.com/owner/repo/tree/main", "owner/repo"),
+            ("https://github.com/some-org", None),  # org page, no repo
+            ("https://github.com/", None),
+            ("https://heliopython.org/projects/", None),  # not github at all
+        ],
+    )
+    def test_github_repo_name_guard(self, url: str, expected):
+        """A non-owner/repo URL must return None, not IndexError — otherwise one odd result
+        crashes the whole gather in _enrich_code_search_with_metadata."""
+        assert RepositorySearchTool._github_repo_name(url) == expected
+
+    @pytest.mark.unit
+    async def test_enrich_skips_non_github_url(self):
+        """A non-GitHub result is returned with empty metadata rather than raising."""
+        tool = RepositorySearchTool()
+        item = SearchResultItem(
+            query="q",
+            title="projects",
+            content="",
+            url=HttpUrlAdapter.validate_python("https://heliopython.org/projects/"),
+        )
+        enriched = await tool._enrich_code_search_with_metadata(item)
+        assert enriched.reliability_score is None
+        assert enriched.repository_metadata.is_null_metadata
 
 
 class TestRepositorySearchTool:
