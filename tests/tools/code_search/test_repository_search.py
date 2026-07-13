@@ -29,6 +29,8 @@ class TestRepositorySearchBackend:
         captured: dict = {}
 
         class _Response:
+            def raise_for_status(self) -> None: ...
+
             @staticmethod
             def json() -> dict:
                 return {"documents": []}
@@ -40,7 +42,8 @@ class TestRepositorySearchBackend:
 
         monkeypatch.setattr(httpx.AsyncClient, "post", _post)
 
-        await RepositorySearchTool(config=RepositorySearchToolConfig())._sde_search(page=1, query="anything")
+        async with httpx.AsyncClient() as client:
+            await RepositorySearchTool(config=RepositorySearchToolConfig())._sde_search(client, page=1, query="anything")
 
         assert captured["url"].endswith("/api/code/search")
         assert captured["payload"]["min_score"] == 0.0

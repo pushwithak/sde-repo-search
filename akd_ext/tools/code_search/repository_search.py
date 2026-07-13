@@ -150,7 +150,7 @@ class RepositorySearchTool(SearchTool):
     config_schema = RepositorySearchToolConfig
 
     @retry(stop=stop_after_attempt(2))
-    async def _sde_search(self, page: int, query: str) -> list[dict]:
+    async def _sde_search(self, client: httpx.AsyncClient, page: int, query: str) -> list[dict]:
         """POST a single SDE code-search request and return the ``documents`` list."""
         payload = {
             "page": page,
@@ -161,9 +161,10 @@ class RepositorySearchTool(SearchTool):
         }
         if self.debug:
             logger.debug(f"SDE payload: {payload}")
-        # Async client so the SDE round-trip doesn't block the event loop.
-        async with httpx.AsyncClient(timeout=self.config.timeout) as client:
-            response = await client.post(self.config.base_url, headers=self.config.headers, json=payload)
+        response = await client.post(self.config.base_url, headers=self.config.headers, json=payload)
+        # Surface HTTP errors (and let @retry act on transient 5xx) instead of
+        # silently treating an error body as "no results".
+        response.raise_for_status()
         return response.json()["documents"]
 
     async def _arun_single_query(
@@ -174,25 +175,30 @@ class RepositorySearchTool(SearchTool):
     ) -> SearchToolOutputSchema:
         """Fetch a single query's worth of results from the SDE code search API."""
         query_results: list[dict] = []
-        for page in range(1, self.config.max_pages + 1):
-            try:
-                page_results = await self._sde_search(page=page, query=query)
-            except Exception as e:
-                logger.error(f"Error during SDE search for '{query}' page {page}: {e}")
-                continue
-            if not page_results:
-                break
-            for result in page_results:
-                result["query"] = query
-            query_results.extend(page_results)
+        # One client reused across pages (and @retry attempts) instead of one per request.
+        async with httpx.AsyncClient(timeout=self.config.timeout) as client:
+            for page in range(1, self.config.max_pages + 1):
+                try:
+                    page_results = await self._sde_search(client, page=page, query=query)
+                except Exception as e:
+                    logger.error(f"Error during SDE search for '{query}' page {page}: {e}")
+                    continue
+                if not page_results:
+                    break
+                for result in page_results:
+                    result["query"] = query
+                query_results.extend(page_results)
 
+        # Filter to valid URLs first, then cap at max_results, so a skipped bad row
+        # backfills from later results rather than shrinking the returned count.
         formatted: list[SearchResultItem] = []
-        for result in query_results[:max_results]:
+        for result in query_results:
+            if len(formatted) >= max_results:
+                break
             raw_url = result.pop("url", "")
             try:
                 url = HttpUrlAdapter.validate_python(raw_url)
             except ValidationError:
-                # Skip a result with a missing/invalid URL rather than failing the whole query.
                 logger.debug(f"Skipping SDE result with invalid URL {raw_url!r}")
                 continue
             formatted.append(
@@ -208,10 +214,19 @@ class RepositorySearchTool(SearchTool):
 
     async def _arun(self, params: RepositorySearchToolInputSchema) -> RepositorySearchToolOutputSchema:
         search_result: SearchToolOutputSchema = await super()._arun(params)
-        tasks: list[asyncio.Task] = [
+        tasks = [
             self._enrich_code_search_with_metadata(repository_item) for repository_item in search_result.results
         ]
-        enriched_results: list[RepositorySearchResultItem] = await asyncio.gather(*tasks)
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        # A single enrichment failure must not sink the whole result set: keep the
+        # result with empty metadata rather than propagating the exception.
+        enriched_results: list[RepositorySearchResultItem] = []
+        for item, outcome in zip(search_result.results, outcomes):
+            if isinstance(outcome, Exception):
+                logger.error(f"Metadata enrichment failed for {item.url}: {outcome}")
+                enriched_results.append(RepositorySearchResultItem(**item.model_dump()))
+            else:
+                enriched_results.append(outcome)
         repository_search_result: RepositorySearchToolOutputSchema = RepositorySearchToolOutputSchema(
             results=enriched_results, extra=search_result.extra
         )
