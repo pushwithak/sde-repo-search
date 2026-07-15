@@ -22,6 +22,12 @@ from ..sde_search import DEFAULT_SDE_BASE_URL
 from .utils import RepositoryMetadata, fetch_github_metadata, calculate_reliability_score
 
 
+# Deployment-only hard cap on how many repositories a single search returns. The
+# result set is trimmed to this before GitHub enrichment, so the tool never
+# returns (or enriches) more than this many items.
+_RESULT_CAP = 5
+
+
 # Schemas (formerly inherited from akd.tools.search.code_search; ported locally
 # after that module was removed upstream — see akd commit 771d7c3.)
 class CodeSearchToolInputSchema(SearchToolInputSchema):
@@ -96,7 +102,10 @@ class RepositorySearchToolConfig(SearchToolConfig):
         default_factory=lambda: os.getenv("SDE_BASE_URL", DEFAULT_SDE_BASE_URL),
         description="SDE API host. The /api/code/search path is appended on each request.",
     )
-    page_size: int = Field(default=10, description="Number of results per page from the SDE API.")
+    page_size: int = Field(
+        default=_RESULT_CAP,
+        description=f"Number of results per page from the SDE API. Hard-capped at {_RESULT_CAP} in this deployment.",
+    )
     max_pages: int = Field(default=1, description="Maximum number of pages to fetch per query.")
     headers: dict = Field(
         default_factory=lambda: {"Content-Type": "application/json", "Accept": "application/json"},
@@ -220,14 +229,17 @@ class RepositorySearchTool(SearchTool):
 
     async def _arun(self, params: RepositorySearchToolInputSchema) -> RepositorySearchToolOutputSchema:
         search_result: SearchToolOutputSchema = await super()._arun(params)
+        # Deployment hard cap: trim to _RESULT_CAP before enrichment so we never
+        # return — or spend GitHub API calls enriching — more than the cap.
+        capped_results = search_result.results[:_RESULT_CAP]
         tasks = [
-            self._enrich_code_search_with_metadata(repository_item) for repository_item in search_result.results
+            self._enrich_code_search_with_metadata(repository_item) for repository_item in capped_results
         ]
         outcomes = await asyncio.gather(*tasks, return_exceptions=True)
         # A single enrichment failure must not sink the whole result set: keep the
         # result with empty metadata rather than propagating the exception.
         enriched_results: list[RepositorySearchResultItem] = []
-        for item, outcome in zip(search_result.results, outcomes):
+        for item, outcome in zip(capped_results, outcomes):
             if isinstance(outcome, Exception):
                 logger.error(f"Metadata enrichment failed for {item.url}: {outcome}")
                 enriched_results.append(RepositorySearchResultItem(**item.model_dump()))

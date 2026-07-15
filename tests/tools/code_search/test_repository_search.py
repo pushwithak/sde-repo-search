@@ -116,18 +116,18 @@ class TestRepositorySearchTool:
         "page_size,result_size",
         [
             (3, 3),
-            (8, 8),
-            (10, 10),
-            (11, 10),  # Capped at max 10
-            (55, 10),  # Capped at max 10
-            (100, 10),  # Capped at max 10
+            (5, 5),
+            (8, 5),  # Hard-capped at 5 in this deployment
+            (55, 5),  # Hard-capped at 5
+            (100, 5),  # Hard-capped at 5
         ],
     )
     @pytest.mark.asyncio
     async def test_repository_search_tool_results_number(self, page_size: int, result_size: int):
-        """Test Repository Search Tool results number."""
+        """Test Repository Search Tool results number (deployment hard cap = 5)."""
         config = RepositorySearchToolConfig(page_size=page_size)
         tool = RepositorySearchTool(config=config)
-        # "nasa python" has >100 results in the SDE code index so any page_size up to the 10 cap works
+        # "nasa python" has >100 results in the SDE code index, so page_size below the
+        # 5-item deployment cap returns page_size results and at/above it returns 5.
         result = await tool.arun(RepositorySearchToolInputSchema(queries=["nasa python"]))
         assert len(result.results) == result_size

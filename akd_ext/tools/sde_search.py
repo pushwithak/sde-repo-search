@@ -24,6 +24,10 @@ from akd_ext.structures import SDEIndexedDocumentType, NASASMDDivision
 #: deployment only has one place to change and one place to override via ``SDE_BASE_URL``.
 DEFAULT_SDE_BASE_URL = "https://dyejsbdumgpqz.cloudfront.net"
 
+#: Deployment-only hard cap on how many results a single search returns. A larger
+#: ``limit`` request is silently clamped to this — the tool never returns more.
+_RESULT_CAP = 5
+
 
 class SDESearchToolConfig(BaseToolConfig):
     """Configuration for the SDE Search Tool."""
@@ -99,7 +103,12 @@ class SDESearchToolInputSchema(InputSchema):
     """Input schema for SDE search queries."""
 
     query: str = Field(..., description="Natural language search query")
-    limit: int = Field(default=10, ge=1, le=100, description="Maximum number of results to return")
+    limit: int = Field(
+        default=_RESULT_CAP,
+        ge=1,
+        le=100,
+        description=f"Maximum number of results to return. Hard-capped at {_RESULT_CAP} in this deployment.",
+    )
 
     doc_type: SDEIndexedDocumentType | None = Field(
         None,
@@ -230,12 +239,16 @@ class SDESearchTool(BaseTool[SDESearchToolInputSchema, SDESearchToolOutputSchema
 
     async def _arun(self, params: SDESearchToolInputSchema) -> SDESearchToolOutputSchema:
         """Execute SDE search query and return formatted results."""
+        # Deployment hard cap: never return more than _RESULT_CAP, even if a larger
+        # limit is requested (silently clamped). Used everywhere below in place of
+        # params.limit for fetch sizing and truncation.
+        effective_limit = min(params.limit, _RESULT_CAP)
         # Calculate fetch size: if URL validation is enabled, fetch more to account for filtering
-        fetch_size = params.limit
+        fetch_size = effective_limit
         if self.config.validate_urls:
-            fetch_size = min(int(params.limit * self.config.result_multiplier), 100)
+            fetch_size = min(int(effective_limit * self.config.result_multiplier), 100)
             logger.debug(
-                f"Fetching {fetch_size} results (limit={params.limit}, multiplier={self.config.result_multiplier})"
+                f"Fetching {fetch_size} results (limit={effective_limit}, multiplier={self.config.result_multiplier})"
             )
 
         # Build request payload
@@ -310,11 +323,12 @@ class SDESearchTool(BaseTool[SDESearchToolInputSchema, SDESearchToolOutputSchema
             documents = validated_documents
             logger.debug(f"Retained {len(documents)} documents after URL validation")
 
-        # Limit results to requested limit (in case we fetched more for validation)
-        final_documents = documents[: params.limit]
+        # Limit results to the effective (hard-capped) limit, in case we fetched
+        # more for validation or the caller requested above the cap.
+        final_documents = documents[:effective_limit]
 
-        if len(documents) > params.limit:
-            logger.debug(f"Truncating {len(documents)} results to requested limit of {params.limit}")
+        if len(documents) > effective_limit:
+            logger.debug(f"Truncating {len(documents)} results to limit of {effective_limit}")
 
         return SDESearchToolOutputSchema(
             results=final_documents,
