@@ -1,6 +1,7 @@
 """FastMCP Server for akd-ext tools."""
 
 from fastmcp import FastMCP
+from loguru import logger
 
 from akd_ext.mcp.registry import MCPToolRegistry
 from akd_ext.mcp.converter import tool_converter, register_mcp_tool
@@ -27,12 +28,26 @@ def register_all_tools():
     # Get all registered tool classes from singleton registry
     tool_classes = MCPToolRegistry().get_tools()
 
+    registered = 0
     for tool_class in tool_classes:
-        tool = tool_class()
-        # Convert tool to FastMCP compatible function
-        mcp_func = tool_converter(tool)
-        # Register tool with FastMCP server
-        register_mcp_tool(mcp_func, mcp)
+        # Isolate each tool: a construction failure (e.g. a required env var
+        # missing for one tool's config) must not abort registration of the
+        # others, which would take the whole server down.
+        try:
+            tool = tool_class()
+            # Convert tool to FastMCP compatible function
+            mcp_func = tool_converter(tool)
+            # Register tool with FastMCP server
+            register_mcp_tool(mcp_func, mcp)
+            registered += 1
+        except Exception as e:
+            logger.warning(f"Skipping tool {tool_class.__name__}: failed to register ({e})")
+
+    # Partial failure is tolerated above, but zero tools means a systemic problem
+    # (e.g. a broken dependency). Fail loudly so the build is rejected and the
+    # previous deployment keeps serving, rather than shipping an empty server.
+    if tool_classes and registered == 0:
+        raise RuntimeError("No MCP tools registered; refusing to start an empty server.")
 
 
 def register_tools_manually(tools: list[type[BaseTool]]) -> None:
